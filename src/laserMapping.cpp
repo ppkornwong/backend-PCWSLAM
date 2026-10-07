@@ -1010,14 +1010,25 @@ int main(int argc, char **argv) {
                             imu_next = *(imu_deque.front());
                             imu_deque.pop_front();
                             double dt = get_time_sec(imu_last.header.stamp) - time_predict_last_const;
-                            
+
                             int robot_stop_conf = nh->get_parameter("mapping.robot_stop_conf").as_int();
 
                             float alpha = 1.0f - std::clamp(robot_stop_conf / 100.0f,0.0f,1.0f);
-                            input_in.gyro *= alpha;
+                            // Scale a LOCAL copy, not input_in itself: input_in
+                            // is the persistent per-node IMU input and is reused
+                            // by every later predict() call in this function
+                            // (including outside this loop and outside this
+                            // scan). Mutating it in place here permanently
+                            // shrinks its gyro every single IMU tick, compounding
+                            // across iterations and never recovering -- this was
+                            // the "big problem" flagged (but never fixed) at the
+                            // call site below.
+                            input_ikfom input_scaled = input_in;
+                            input_scaled.gyro *= alpha;
+                            input_scaled.acc *= alpha;
                             double scaled_dt = dt * alpha;
-                            kf_output.predict(scaled_dt, Q_output, input_in, true, false);
-                            time_predict_last_const = get_time_sec(imu_last.header.stamp); // big problem
+                            kf_output.predict(scaled_dt, Q_output, input_scaled, true, false);
+                            time_predict_last_const = get_time_sec(imu_last.header.stamp);
                             imu_comes = time_current > get_time_sec(imu_next.header.stamp);
                             // if (!imu_comes)
                             {
@@ -1028,7 +1039,7 @@ int main(int argc, char **argv) {
                                     double propag_imu_start = omp_get_wtime();
                                     double scaled_dt_cov = dt_cov * alpha;
 
-                                    kf_output.predict(scaled_dt_cov, Q_output, input_in, false, true);
+                                    kf_output.predict(scaled_dt_cov, Q_output, input_scaled, false, true);
 
                                     propag_time += omp_get_wtime() - propag_imu_start;
                                     double solve_imu_start = omp_get_wtime();
@@ -1041,44 +1052,32 @@ int main(int argc, char **argv) {
 
                     double dt = time_current - time_predict_last_const;
 
-                    // 🔽 get param here (or once per scan loop)
                     int robot_stop_conf =
-		    nh->get_parameter("mapping.robot_stop_conf").as_int();
+                        nh->get_parameter("mapping.robot_stop_conf").as_int();
 
-		float conf = std::clamp(robot_stop_conf / 100.0f,
-				        0.0f,
-				        1.0f);
+                    float conf = std::clamp(robot_stop_conf / 100.0f,
+                                             0.0f,
+                                             1.0f);
 
-		float alpha = std::max(0.02f,
-				       1.0f - conf);
+                    float alpha = std::max(0.02f,
+                                            1.0f - conf);
 
-		input_ikfom input_scaled = input_in;
+                    // Always take the scaled predict, no alpha>0.5 branch:
+                    // previously a second, full/unscaled predict also ran
+                    // over the same dt whenever alpha > 0.5, double-
+                    // integrating the motion for that time step and making
+                    // alpha's damping a no-op right at that boundary. With
+                    // robot_stop_conf == 0 (robot moving, not stationary),
+                    // conf == 0 so alpha == 1.0 and this reduces to an
+                    // ordinary full-strength predict anyway.
+                    input_ikfom input_scaled = input_in;
+                    input_scaled.gyro *= alpha;
+                    input_scaled.acc *= alpha;
 
-		input_scaled.gyro *= alpha;
-		input_scaled.acc *= alpha;
+                    double scaled_dt = dt * alpha;
 
-		double scaled_dt = dt * alpha;
-
-		kf_output.predict(scaled_dt,
-				  Q_output,
-				  input_scaled,
-				  true,
-				  false);
-
-                    if (alpha > 0.5) {
-                        if (!prop_at_freq_of_imu) {
-                            double dt_cov = time_current - time_update_last;
-                            if (dt_cov > 0.0) {
-                                kf_output.predict(dt_cov, Q_output, input_in, false, true);
-                                time_update_last = time_current;
-                            }
-                        }
-
-                        kf_output.predict(dt, Q_output, input_in, true, false);
-                    } else {
-                        // skip prediction, keep previous state
-                        time_update_last = time_current;
-                    }
+                    kf_output.predict(scaled_dt, Q_output, input_scaled, true, false);
+                    time_update_last = time_current;
 
                     time_predict_last_const = time_current;
                     // if(k == 0)
@@ -1337,8 +1336,6 @@ int main(int argc, char **argv) {
 
                     propag_time += omp_get_wtime() - propag_start;
 
-                    propag_time += omp_get_wtime() - propag_start;
-
                     // if(k == 0)
                     // {
                     //     fout_imu_pbp << Measures.lidar_last_time - first_lidar_time << " " << imu_last.angular_velocity.x << " " << imu_last.angular_velocity.y << " " << imu_last.angular_velocity.z \
@@ -1403,6 +1400,17 @@ int main(int argc, char **argv) {
             nh->get_parameter("mapping.landmark_pos_y",    landmark_pos_y);
             nh->get_parameter("mapping.landmark_weight",   landmark_weight);
 
+            // Reset the anchor as soon as the landmark disappears, regardless
+            // of landmark_weight. This must sit outside the
+            // `landmark_detected && ...` block below: nested inside it, the
+            // `!landmark_detected` reset could never fire (that block only
+            // ever runs when landmark_detected is true), so the anchor was
+            // never cleared and a later re-detection compared against a
+            // stale, possibly-distant lm_world_stored from a previous pass.
+            if (!landmark_detected) {
+                lm_world_initialized = false;
+            }
+
             if (landmark_detected && landmark_weight > 1.0)
             {
                 // Current estimated position and rotation
@@ -1427,10 +1435,6 @@ int main(int argc, char **argv) {
                 }
                 // Residual: how far has the robot drifted from the anchored landmark?
                 V3D r_lm = lm_world - lm_world_stored;
-                // Reset anchor when landmark disappears for more than N seconds
-                // (handled by landmark_detected going false)
-                if (!landmark_detected)
-                    lm_world_initialized = false;
                 // Observation noise: high weight → low variance → strong correction
                 double sigma2 = 1.0 / std::max(landmark_weight * 0.01, 1e-6);
 
